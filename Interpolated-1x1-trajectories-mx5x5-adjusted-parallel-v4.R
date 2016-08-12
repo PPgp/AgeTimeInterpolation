@@ -20,7 +20,6 @@
 # install.packages("varhandle")
 # install.packages("berryFunctions")
 
-
 ## library(bayesPop)
 library(reshape2)
 library(readr)
@@ -510,6 +509,11 @@ for(LocID in country.codes) {
 
 	## recompute lx
 	u10lt[, lx := c(1, cumprod(1 - qx)), by=.(LocID, SexID, MidPeriod, Trajectory)]
+	  ## TODO: resolve warning
+	  ## RHS 1 is length 12 (greater than the size (11) of group 44). The last 1 element(s) will be discarded.
+	  ## if dropping last element is desirable, could replace by
+	  ##   u10lt[, lx := c(1, cumprod(1 - qx))[1:length(qx)], by=.(LocID, SexID, MidPeriod, Trajectory)]
+
 	## compute ax
 	u10lt[, ax := 0.5]
 	u10lt[Age == 0, ax := ax_0]
@@ -552,7 +556,7 @@ for(LocID in country.codes) {
 	
 	rm("u10lt")
 	
- 	## order rows
+	## order rows - needed in interp1 (ifunS2)
 	setorder(mx5icm, LocID, SexID, MidPeriod, Trajectory,  MidAge)
 	
 
@@ -584,35 +588,14 @@ for(LocID in country.codes) {
 	#start time
 	## strt<-Sys.time()
 
-	# Initiate cluster
-	no_cores <- min(detectCores(), nr.traj) ## - 1
-	cl <- makeCluster(no_cores, type = "PSOCK")
-	registerDoParallel(cl)
-	## make the data/variables available to each cluster
-	clusterExport(cl, c("LocID", "mx5icm", "Trajectory", "MidPeriod", "Age1"))
+	ifunS2 <- function(MidAge, mx) {
+		mx[mx<=0] <-(1/100000000)
+		yinterpol <- interp1(MidAge, log(mx), Age1, 'pchip', extrap = TRUE)
+		list(Age=Age1-0.5, mx=exp(yinterpol))
+	}
 
-	mx5x1.long <- NULL
-	mx5x1.long <- foreach(k = Trajectory, .packages=c("data.table", "signal"), .combine=rbind) %dopar% {
-			mx5x1.long <- NULL
-			for (j in 1:2) { ## by sex for male and female
-				for (l in MidPeriod) {
-					 ## input <- mx5icm[SexID==2 & MidPeriod==2098 & Trajectory==427,]
-					 input <- mx5icm[SexID==j & Trajectory==k & MidPeriod==l,]
-					 ## deal with exception if exactly 0 and log
-					 input$mx[input$mx<=0] <- (1/100000000)
-					 yinterpol <- interp1(input$MidAge, log(input$mx), Age1, 'pchip', extrap = TRUE)
-					 
-					 mx5x1.long <- rbind(mx5x1.long, cbind(LocID, SexID=j, MidPeriod=l, Age=Age1-0.5, Trajectory=k, mx=exp(yinterpol)))
-				}
-		}
-		return(mx5x1.long)
-	} # next trajectory
-	
-	stopCluster(cl)
-	## print(Sys.time()-strt)
+	mx5x1.long <- mx5icm[, ifunS2(MidAge, mx) ,by=.(LocID, SexID, MidPeriod, Trajectory)]
 
-	
-	mx5x1.long <- data.table(mx5x1.long)
 	rm("mx5icm")
 	## subset(mx5x1.long, SexID==1 & Trajectory==1 & MidPeriod==2013)
 
@@ -623,14 +606,13 @@ for(LocID in country.codes) {
 	gc()
 
 	## sort records
-	setorder(mx5x1.long.oage, LocID, SexID, MidPeriod, Trajectory, Age)
+	## setorder(mx5x1.long.oage, LocID, SexID, MidPeriod, Trajectory, Age)
 
 	## reshape with Trajectory in column
 	mx5x1.wide <- dcast(mx5x1.long.oage, LocID + SexID + Age + MidPeriod ~ Trajectory, value.var=c("mx"))	
-	setorder(mx5x1.wide, LocID, SexID, Age, MidPeriod)
+	##setorder(mx5x1.wide, LocID, SexID, Age, MidPeriod)
 	rm("mx5x1.long.oage")
 	# mx5x1.wide$MidPeriod <- as.numeric(mx5x1.wide$MidPeriod)
-	Age1 <- unique(mx5x1.wide$Age)
 
 	# test
 	# mx5x1.wide2 <- mx5x1.wide
@@ -642,33 +624,20 @@ for(LocID in country.codes) {
 	## process matrix by sex (male and female)
 
 	strt<-Sys.time()
-	no_cores <- min(detectCores(), nr.traj) ## - 1
-	cl <- makeCluster(no_cores, type = "PSOCK")
-	registerDoParallel(cl)
-	clusterExport(cl, c("mx5x1.wide", "Age1"))
-	mx1x1 <- NULL
-	mx1x1 <- foreach(k = Age1, .packages=c("data.table"), .combine=rbind) %dopar% {
-				mx1x1 <- NULL
-				for (j in 1:2) { ## by sex for male and female
-					input <- as.data.frame(mx5x1.wide[SexID==j & Age==k,])
-				
-					## interpolate data using Beers Modified
-					data <- input[,5:ncol(input)]
-					rownames(data) <- input$MidPeriod
-					output.wide <- BeersMSplit(data)   ## interpolated over time and get back mid-year results
-					output.wide <- as.data.frame(output.wide) * 5  ## to rescale back (per default function is for counts, not rates and split input by 1/5)
-							
-					## combine back IDs and column headers
-					Year <- c((min(input$MidPeriod-3)):(max(input$MidPeriod+1)))
-					output.wide <- cbind(LocID=LocID, SexID=j, Year, Age=k, output.wide)
-					mx1x1 <- rbind(mx1x1, output.wide)
-				}
-				return(mx1x1)
-			}
-	stopCluster(cl)
 
-	
-	mx1x1 <- data.table(mx1x1)
+	ifunS3 <- function(a, mpdata) {
+		data <- mpdata[,2:ncol(mpdata), with=F]
+		output.wide <- BeersMSplit(data) * 5
+			## interpolated over time and get back mid-year results
+			## *5 to rescale back (per default function is for counts, not rates and split input by 1/5)
+		MidPeriod <- mpdata[[1]]
+		Year <- (min(MidPeriod)-3):(max(MidPeriod)+1)
+		data.table(cbind(Year, output.wide))
+	}
+
+	mx1x1 <- mx5x1.wide[,ifunS3(Age, .SD),by=.(LocID, Age, SexID)]
+	mx1x1 <- mx1x1[,MidPeriod := NULL]
+
 	rm("mx5x1.wide")
 
 	mx1x1.long <- melt(mx1x1, id=c("LocID", "SexID", "Year", "Age"), variable="Trajectory", value.name="mx")
@@ -676,7 +645,7 @@ for(LocID in country.codes) {
 	# HS: use data.table for ordering
 	#mx1x1.long <- mx1x1.long[order(mx1x1.long$LocID, mx1x1.long$SexID, mx1x1.long$Year, mx1x1.long$Trajectory, mx1x1.long$Age),]
 	#stop('')
-	setorder(mx1x1.long, LocID, SexID, Year, Trajectory, Age)
+	##setorder(mx1x1.long, LocID, SexID, Year, Trajectory, Age)
 	
 	## censor year before start of pop. projections (i.e., pop open age group = 100)
 	mx1x1.long <- mx1x1.long[Year >= YearWPP, ]
@@ -766,130 +735,114 @@ for(LocID in country.codes) {
 	rm("mx1x1.wide")
 	# HS
 	#lt1.long <- lt1.long[order(lt1.long$LocID, lt1.long$SexID, lt1.long$Year, lt1.long$Trajectory, lt1.long$Age),]
-	setorder(lt1.long, LocID, SexID, Year, Trajectory, Age)
+	##setorder(lt1.long, LocID, SexID, Year, Trajectory, Age)
 
 	## reshape with Trajectory in column
 	mx1x1.wide <- dcast(lt1.long, LocID + SexID + Year + Age ~ Trajectory, value.var=c("mx"))
 	rm("lt1.long")
 	# HS
 	#mx1x1.wide <- mx1x1.wide[order(mx1x1.wide$LocID, mx1x1.wide$SexID, mx1x1.wide$Year, mx1x1.wide$Age),]
-	setorder(mx1x1.wide, LocID, SexID, Year, Age)
+	##setorder(mx1x1.wide, LocID, SexID, Year, Age)
 	gc()
 
-	Year <- unique(mx1x1.wide$Year)
 	print(paste("step: 5a", Sys.time()-strt))
-	
-	## mx1x1.wide <- as.data.frame(mx1x1.wide)
-	for (j in SexID) {
-		## loop in parallel thru the years
-		strt<-Sys.time()
-		no_cores <- min(detectCores(), nr.traj) ## - 1
-		cl <- makeCluster(no_cores, type = "PSOCK")
-		registerDoParallel(cl)
-		clusterExport(cl, c("mx1x1.wide", "j", "Year"))
-		lt1 <- NULL
-		lt1 <- foreach(k = Year, .packages=c("data.table"), .combine=rbind) %dopar% {
-			lt1 <- NULL
-			lt <- mx1x1.wide[SexID==j & Year==k,]
-			## for memory/speed efficiency, works with data frame for each LT indicator to be able to apply more efficient R on the whole frames and avoid loops
-			lt.mx <- as.data.frame(lt[, 5:ncol(lt), with=FALSE])
-	        
-			## mx for open age /* reciprocal of 1/ex for open age group*/ 
-	        
-			## max age
-			nmax <- max(lt$Age)
-			
-			## compute ax
-			lt.ax <- lt.mx
-			lt.ax[,] <- 0.5 # (default like HMD)
-			## for under age 1: CD-West
-			## Male
-			if (j==1){
-				lt.ax[1,lt.mx[1,] < 0.107] <- 0.045 + 2.684 * lt.mx[1, lt.mx[1,] < 0.107]
-				lt.ax[1,lt.mx[1,] >= 0.107] <- 0.33
-			}
-			## Female & Both sexes
-			if (j>=2){
-				lt.ax[1,lt.mx[1,] < 0.107] <- 0.053 + 2.8 * lt.mx[1, lt.mx[1,] < 0.107]
-				lt.ax[1,lt.mx[1,] >= 0.107] <- 0.35
-			}
-			## for open age group ax = ex
-			
-			# n width of the age intervals
-			lt.n <- lt.mx
-			lt.n[,] <- c(diff(lt$Age),-1)
-			lt.n[lt$Age == nmax,] <- -1
-			
-			# nqx = n * mx / (1 + (n - ax) * mx)
-			lt.qx <- lt.mx
-			lt.qx <- (lt.n * lt.mx) / (1 + (lt.n  - lt.ax) * lt.mx)
-			lt.qx[lt.qx>1] <- 1 # necessary for high nMx
-			## open age /* cannot be computed due to trunaction (would be 1 is open age group is higher)*
-			lt.qx[lt$Age == nmax,] <- NA 
-			
-			## Px <- (1 - Qx)
-			
-			# lx
-			lt.lx <- lt.mx
-			lt.lx[,] <- rbind(1, cumprod(1 - lt.qx[1:nrow(lt.lx),]))
-			lt.lx <- lt.lx * 100000
-			
-			# dx
-			lt.dx <- lt.lx * lt.qx
-			## open age group dx = lx
-			lt.dx[lt$Age == nmax,] <- lt.lx[lt$Age == nmax,]
-			
-			# Lx
-			lt.Lx <- (lt.n * lt.lx) - (lt.ax * lt.dx)       # equivalent to n*l(x+n) + (n-nax)*ndx
-			## open age group Lx = Tx
-			lt.Lx[lt$Age==nmax,] <- lt.lx[lt$Age==nmax,] * lt.ax[lt$Age==nmax,]
-			
-			# Sx
-			# for open age group, e.g., 85+ 
-			## penultimate age group -> Last entry of S(x,n) is S( 80+,5) = T( 85) / T( 80)
-			## for open age group iteself: Sx cannot be computed due to trunaction Sx <- NA
-			
-			# Tx
-			lt.Tx <- lt.Lx
-			rownames(lt.Tx) <- lt$Age
-			lt.Tx <- lt.Tx[rev(rownames(lt.Tx)),]					
-			lt.Tx <- cumsum(lt.Tx)
-			lt.Tx <- lt.Tx[rev(rownames(lt.Tx)),]
-			rownames(lt.Tx) <- lt$Age
-			
-			# ex
-			lt.ex <- lt.Tx / lt.lx
-			## for open age group mx=1/ex and ax = ex
-			## lt.mx[lt$Age==nmax,] <- 1 / lt.ex[lt$Age==nmax,]
-			## lt.ex[lt$Age==nmax,] <- 1 / lt.mx[lt$Age==nmax,]
-			lt.ax[lt$Age==nmax,] <- lt.ex[lt$Age==nmax,]
+
+	ifunS5 <- function(SexID, Age, lt.mx) {
+
+		## mx for open age /* reciprocal of 1/ex for open age group*/
+		## max age
+		nmax <- max(Age)
+		## compute ax
+		lt.ax <- lt.mx
+		lt.ax[,] <- 0.5 # (default like HMD)
+		## for under age 1: CD-West
+		## Male
+		if (SexID==1){
+			lt.ax[1,lt.mx[1,] < 0.107] <- 0.045 + 2.684 * lt.mx[1, lt.mx[1,] < 0.107]
+			lt.ax[1,lt.mx[1,] >= 0.107] <- 0.33
+		}
+		## Female & Both sexes
+		if (SexID>=2){
+			lt.ax[1,lt.mx[1,] < 0.107] <- 0.053 + 2.8 * lt.mx[1, lt.mx[1,] < 0.107]
+			lt.ax[1,lt.mx[1,] >= 0.107] <- 0.35
+		}
+		## for open age group ax = ex
 				
-			lt.all <- rbind(
-			cbind(lt[,3:4, with=FALSE], Indicator="mx", lt.mx),
-			cbind(lt[,3:4, with=FALSE], Indicator="qx", lt.qx),
-			cbind(lt[,3:4, with=FALSE], Indicator="lx", lt.lx),
-			cbind(lt[,3:4, with=FALSE], Indicator="dx", lt.dx),
-			cbind(lt[,3:4, with=FALSE], Indicator="Lx", lt.Lx),
-			cbind(lt[,3:4, with=FALSE], Indicator="Tx", lt.Tx),
-			cbind(lt[,3:4, with=FALSE], Indicator="ex", lt.ex),
-			cbind(lt[,3:4, with=FALSE], Indicator="ax", lt.ax))
-			
-			lt1 <- rbind(lt1, lt.all)
-			return(lt1)
-		} # next year
-		stopCluster(cl)	
-			
-		## rm("mx1x1.wide")
-		gc()
-		
+		# n width of the age intervals
+		lt.n <- lt.mx
+		lt.n[,] <- c(diff(Age),-1)
+		lt.n[Age == nmax,] <- -1
+
+		# nqx = n * mx / (1 + (n - ax) * mx)
+		lt.qx <- lt.mx
+		lt.qx <- (lt.n * lt.mx) / (1 + (lt.n  - lt.ax) * lt.mx)
+		lt.qx[lt.qx>1] <- 1 # necessary for high nMx
+		## open age /* cannot be computed due to trunaction (would be 1 is open age group is higher)*
+		lt.qx[Age == nmax,] <- NA
+
+		## Px <- (1 - Qx)
+
+		# lx
+		lt.lx <- lt.mx
+		cp <- apply(1 - lt.qx[1:nrow(lt.lx),], 2, cumprod) ## cumprod for matrix ignores dimensions
+		lt.lx[,] <- rbind(1, cp[1:(nrow(cp)-1),]) ## need to have the same dimensions on lhs and rhs
+			## TODO: check the removal of last rows above is what should be done
+		lt.lx <- lt.lx * 100000
+
+		# dx
+		lt.dx <- lt.lx * lt.qx
+		## open age group dx = lx
+		lt.dx[Age == nmax,] <- lt.lx[Age == nmax,]
+
+		# Lx
+		lt.Lx <- (lt.n * lt.lx) - (lt.ax * lt.dx)       # equivalent to n*l(x+n) + (n-nax)*ndx
+		## open age group Lx = Tx
+		lt.Lx[Age==nmax,] <- lt.lx[Age==nmax,] * lt.ax[Age==nmax,]
+
+		# Sx
+		# for open age group, e.g., 85+
+		## penultimate age group -> Last entry of S(x,n) is S( 80+,5) = T( 85) / T( 80)
+		## for open age group iteself: Sx cannot be computed due to trunaction Sx <- NA
+
+		# Tx
+		lt.Tx <- apply(lt.Lx, 2, function(x) rev(cumsum(rev(x))))
+		# ex
+		lt.ex <- lt.Tx / lt.lx
+		## for open age group mx=1/ex and ax = ex
+		## lt.mx[lt$Age==nmax,] <- 1 / lt.ex[lt$Age==nmax,]
+		## lt.ex[lt$Age==nmax,] <- 1 / lt.mx[lt$Age==nmax,]
+		lt.ax[Age==nmax,] <- lt.ex[Age==nmax,]
+
+		rbind(
+			cbind(Age, Indicator="mx", data.frame(lt.mx)),
+			cbind(Age, Indicator="qx", data.frame(lt.qx)),
+			cbind(Age, Indicator="lx", data.frame(lt.lx)),
+			cbind(Age, Indicator="dx", data.frame(lt.dx)),
+			cbind(Age, Indicator="Lx", data.frame(lt.Lx)),
+			cbind(Age, Indicator="Tx", data.frame(lt.Tx)),
+			cbind(Age, Indicator="ex", data.frame(lt.ex)),
+			cbind(Age, Indicator="ax", data.frame(lt.ax))
+		)
+	}
+
+
+	no_cores <- min(detectCores(logical=F), length(SexID))
+	cl <- makeCluster(no_cores, type="PSOCK", outfile="", useXDR=FALSE)
+	registerDoParallel(cl)
+	clusterExport(cl, c("mx1x1.wide", "strt", "ifunS5"))
+	foreach(j = SexID, .packages=c("data.table")) %dopar% {
+
+		lt1 <- mx1x1.wide[SexID==j, ifunS5(SexID, Age, as.matrix(.SD)), by=.(LocID, SexID, Year), .SDcols=5:ncol(mx1x1.wide)]
+		lt1[, SexID := NULL]
+		lt1[, LocID := NULL]
+		colnames(lt1)[4:ncol(lt1)] <- as.character(1:nr.traj)
+			## note: the column numbers/names get eventually to output csv files
 
 		## reshape life table into long format (note: this gets pretty big - need > 16GB virtual RAM)\
 		# HS: use data.table for melting and ordering
-		lt1 <- data.table(lt1)
 		lt1.long <- melt(lt1, id=c("Year", "Age", "Indicator"), variable="Trajectory", value.name="Value")
 		#lt1.long <- lt1.long[order(lt1.long$Year, lt1.long$Trajectory, lt1.long$Indicator, lt1.long$Age),]
-		setorder(lt1.long, Year, Trajectory, Indicator, Age)
-		
+		## setorder(lt1.long, Year, Trajectory, Indicator, Age)
 		## lsMem()
 		## object.size(lt1.long)
 		rm("lt1")
@@ -927,7 +880,6 @@ for(LocID in country.codes) {
 		# HS: data.table ordering of rows
 		#lt1x1.wide <- lt1x1.wide[order(lt1x1.wide$Year, lt1x1.wide$Trajectory, lt1x1.wide$Age),]
 		setorder(lt1x1.wide, Year, Trajectory, Age)
-		
 		## record columns and add LocID back
 		
 		## attach(lt1x1.wide, warn.conflicts = FALSE)
@@ -1006,38 +958,39 @@ for(LocID in country.codes) {
 		
 		# HS: all writes below can be written like this (instead of using the if statement):
 		# fwrite(data, paste0("UN_PPP2015_mx1x1_by_Time_", LocID,".csv"), append = j>1, col.names = j==1)
-		fwrite(data[SexID==j], paste("UN_PPP2015_mx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_mx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 
 	
 		data <- dcast(lt1x1.wide, LocID + SexID + Trajectory + Age ~ Year, value.var=c("qx"))
 		setorder(data, LocID, SexID, Trajectory, Age)
-		fwrite(data[SexID==j], paste("UN_PPP2015_qx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_qx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 	
 		data <- dcast(lt1x1.wide, LocID + SexID + Trajectory + Age ~ Year, value.var=c("lx"))
 		setorder(data, LocID, SexID, Trajectory, Age)
-		fwrite(data[SexID==j], paste("UN_PPP2015_lx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_lx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 	
 		data <- dcast(lt1x1.wide, LocID + SexID + Trajectory + Age ~ Year, value.var=c("Tx"))
 		setorder(data, LocID, SexID, Trajectory, Age)
-		fwrite(data[SexID==j], paste("UN_PPP2015_Tx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_Tx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 	
 		data <- dcast(lt1x1.wide, LocID + SexID + Trajectory + Age ~ Year, value.var=c("Lx"))
 		setorder(data, LocID, SexID, Trajectory, Age)
-		fwrite(data[SexID==j], paste("UN_PPP2015_Yx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_Yx1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 	
 		data <- dcast(lt1x1.wide, LocID + SexID + Trajectory + Age ~ Year, value.var=c("ex"))
 		setorder(data, LocID, SexID, Trajectory, Age)
-		fwrite(data[SexID==j], paste("UN_PPP2015_ex1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_ex1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 	
 		data <- dcast(lt1x1.wide, LocID + SexID + Trajectory + Age ~ Year, value.var=c("ax"))
 		setorder(data, LocID, SexID, Trajectory, Age)
-		fwrite(data[SexID==j], paste("UN_PPP2015_ax1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
+		fwrite(data, paste("UN_PPP2015_ax1x1_by_Time_", Sex[j], "_", LocID, ".csv",sep=""), append = FALSE, col.names = TRUE, turbo = TRUE)
 	
 		rm("lt1x1.wide", "data")
 		gc()
 		print(paste("step: 5 - Sex:", Sex[j], "   ", Sys.time()-strt))
 	
 	} # next sex
+	stopCluster(cl)
 	rm("mx1x1.wide")
 	gc()
 } # next country
